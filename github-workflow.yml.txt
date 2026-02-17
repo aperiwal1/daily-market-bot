@@ -1,0 +1,260 @@
+# .github/workflows/daily-market-post.yml
+#
+# Unified: Google Sheet market data + Finviz heatmap → single Slack post
+# Runs Mon–Fri at 4:15 PM ET (DST-aware), skips NYSE holidays + duplicates.
+
+name: Daily Market Summary + Heatmap
+
+on:
+  schedule:
+    - cron: "15 20 * * 1-5"   # 4:15 PM EDT (summer)
+    - cron: "15 21 * * 1-5"   # 4:15 PM EST (winter)
+  workflow_dispatch:           # manual trigger
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: daily-market-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      market_text: ${{ steps.run_bot.outputs.market_text }}
+      skipped: ${{ steps.gate.outputs.skipped }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log current time
+        run: |
+          echo "UTC:      $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "New York: $(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S %Z')"
+
+      # ── DST gate: only run the correct cron for the current timezone ──
+      - name: DST + time window gate
+        id: gate
+        run: |
+          NY_DOW=$(TZ="America/New_York" date +'%u')
+          NY_HOUR=$(TZ="America/New_York" date +'%H')
+          NY_MIN=$(TZ="America/New_York" date +'%M')
+          echo "NY: DOW=${NY_DOW} ${NY_HOUR}:${NY_MIN}"
+
+          # Skip weekends
+          if [ "$NY_DOW" -lt 1 ] || [ "$NY_DOW" -gt 5 ]; then
+            echo "Weekend — skipping."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Must be within 16:05–16:25 ET window (cron can drift a few min)
+          TOTAL_MIN=$((NY_HOUR * 60 + NY_MIN))
+          if [ "$TOTAL_MIN" -lt 965 ] || [ "$TOTAL_MIN" -gt 985 ]; then
+            echo "Outside 16:05–16:25 ET — wrong DST cron, skipping."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Within window — continuing."
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+      # ── NYSE holiday check ──
+      - name: Set NY date
+        if: steps.gate.outputs.skipped != 'true'
+        run: echo "DATE_NY=$(TZ='America/New_York' date +%Y-%m-%d)" >> $GITHUB_ENV
+
+      - name: Skip if NYSE holiday
+        if: steps.gate.outputs.skipped != 'true'
+        run: |
+          python3 - <<'PY'
+          import os
+          from datetime import date, timedelta
+
+          def nth_weekday(year, month, weekday, n):
+              d = date(year, month, 1)
+              while d.weekday() != weekday:
+                  d += timedelta(days=1)
+              return d + timedelta(days=7*(n-1))
+
+          def last_weekday(year, month, weekday):
+              d = date(year, month+1, 1) - timedelta(days=1) if month < 12 else date(year, 12, 31)
+              while d.weekday() != weekday:
+                  d -= timedelta(days=1)
+              return d
+
+          def easter_date(year):
+              a = year % 19; b = year // 100; c = year % 100
+              d = b // 4; e = b % 4; f = (b + 8) // 25; g = (b - f + 1) // 3
+              h = (19*a + b - d - g + 15) % 30; i = c // 4; k = c % 4
+              l = (32 + 2*e + 2*i - h - k) % 7; m = (a + 11*h + 22*l) // 451
+              month = (h + l - 7*m + 114) // 31; day = ((h + l - 7*m + 114) % 31) + 1
+              return date(year, month, day)
+
+          def observed(dt):
+              if dt.weekday() == 5: return dt - timedelta(days=1)
+              if dt.weekday() == 6: return dt + timedelta(days=1)
+              return dt
+
+          y = int(os.environ["DATE_NY"][:4])
+          hol = {
+              observed(date(y,1,1)), nth_weekday(y,1,0,3), nth_weekday(y,2,0,3),
+              easter_date(y) - timedelta(days=2), last_weekday(y,5,0),
+              observed(date(y,6,19)), observed(date(y,7,4)), nth_weekday(y,9,0,1),
+              nth_weekday(y,11,3,4), observed(date(y,12,25)),
+          }
+          today = date.fromisoformat(os.environ["DATE_NY"])
+          if today in hol:
+              print(f"{today} is NYSE holiday — skipping."); raise SystemExit(0)
+          print(f"{today} — not a holiday.")
+          PY
+
+      # ── Duplicate guard ──
+      - name: Restore posted cache
+        if: steps.gate.outputs.skipped != 'true'
+        id: posted_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .post-cache-market
+          key: market-posted-${{ env.DATE_NY }}
+
+      - name: Skip if already posted
+        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit == 'true'
+        run: |
+          echo "Already posted for ${DATE_NY}."
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
+
+      # ── Python setup + run ──
+      - name: Set up Python
+        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
+        run: |
+          pip install requests playwright
+          playwright install --with-deps chromium
+
+      - name: Run daily market bot
+        id: run_bot
+        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
+        run: python daily_market_post.py
+
+      # ── Artifacts + cache ──
+      # ── Preserve previous heatmaps so old Slack links don't break ──
+      - name: Download previous Pages artifact (if any)
+        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: |
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY##*/}"
+          BASE="https://${OWNER}.github.io/${REPO}"
+
+          # Fetch the index of existing heatmaps from the last 90 days
+          echo "Restoring previous heatmaps from GitHub Pages..."
+          for i in $(seq 0 90); do
+            DATE=$(date -u -d "$i days ago" +%Y-%m-%d 2>/dev/null || date -u -v-${i}d +%Y-%m-%d 2>/dev/null)
+            FILE="sp500_heatmap_${DATE}.png"
+            URL="${BASE}/${FILE}"
+            # Only download if we don't already have it locally
+            if [ ! -f "site/${FILE}" ]; then
+              HTTP_CODE=$(curl -s -o "site/${FILE}" -w "%{http_code}" "$URL")
+              if [ "$HTTP_CODE" != "200" ]; then
+                rm -f "site/${FILE}"
+              else
+                echo "  Restored: ${FILE}"
+              fi
+            fi
+          done
+          echo "Done restoring previous heatmaps."
+
+      - name: Upload Pages artifact
+        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+      - name: Save posted cache
+        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .post-cache-market
+          echo "posted $(date -u)" > .post-cache-market/posted.txt
+      - uses: actions/cache/save@v4
+        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
+        with:
+          path: .post-cache-market
+          key: market-posted-${{ env.DATE_NY }}
+
+  # ────────────────────────────────────────────────────────────────────
+  deploy:
+    needs: build
+    if: needs.build.outputs.skipped != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
+
+  # ────────────────────────────────────────────────────────────────────
+  notify-slack:
+    needs: [build, deploy]
+    if: needs.build.outputs.skipped != 'true'
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+    steps:
+      - name: Build URLs
+        run: |
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY##*/}"
+          echo "BASE_URL=https://${OWNER}.github.io/${REPO}" >> $GITHUB_ENV
+          echo "DATE_NY=$(TZ='America/New_York' date +%Y-%m-%d)" >> $GITHUB_ENV
+
+      - name: Wait for image on Pages (max ~2.5 min)
+        run: |
+          URL="${BASE_URL}/sp500_heatmap_${DATE_NY}.png"
+          echo "Waiting for $URL"
+          for i in {1..30}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+            [ "$code" = "200" ] && echo "OK" && break
+            sleep 5
+          done
+
+      - name: Post combined message to Slack
+        env:
+          MARKET_TEXT: ${{ needs.build.outputs.market_text }}
+        run: |
+          HEAT_URL="${BASE_URL}/sp500_heatmap_${DATE_NY}.png"
+
+          # Build JSON payload — text summary + heatmap image
+          # Using jq for safe JSON escaping
+          jq -n \
+            --arg text "$MARKET_TEXT" \
+            --arg img "$HEAT_URL" \
+            --arg date "$DATE_NY" \
+            '{
+              text: $text,
+              attachments: [
+                {
+                  fallback: ("S&P 500 Heatmap – " + $date),
+                  title: ":world_map: S&P 500 Heatmap",
+                  image_url: $img,
+                  color: "#2eb886"
+                }
+              ]
+            }' > payload.json
+
+          echo "--- Payload ---"
+          cat payload.json
+          echo "----------------"
+
+          curl -sS --max-time 20 -X POST \
+            -H 'Content-type: application/json' \
+            --data @payload.json \
+            "${SLACK_WEBHOOK}"

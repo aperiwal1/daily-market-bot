@@ -38,9 +38,17 @@ jobs:
           echo "New York: $(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S %Z')"
 
       # ── DST gate: only run the correct cron for the current timezone ──
+      # Manual triggers (workflow_dispatch) bypass all time checks
       - name: DST + time window gate
         id: gate
         run: |
+          # Skip time checks entirely for manual triggers
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger — bypassing time gate."
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           NY_DOW=$(TZ="America/New_York" date +'%u')
           NY_HOUR=$(TZ="America/New_York" date +'%H')
           NY_MIN=$(TZ="America/New_York" date +'%M')

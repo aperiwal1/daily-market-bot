@@ -61,10 +61,10 @@ jobs:
             exit 0
           fi
 
-          # Must be within 16:05–16:25 ET window (cron can drift a few min)
+          # Must be within 15:45–16:45 ET window (GitHub cron can drift significantly)
           TOTAL_MIN=$((NY_HOUR * 60 + NY_MIN))
-          if [ "$TOTAL_MIN" -lt 965 ] || [ "$TOTAL_MIN" -gt 985 ]; then
-            echo "Outside 16:05–16:25 ET — wrong DST cron, skipping."
+          if [ "$TOTAL_MIN" -lt 945 ] || [ "$TOTAL_MIN" -gt 1005 ]; then
+            echo "Outside 15:45–16:45 ET — wrong DST cron, skipping."
             echo "skipped=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi

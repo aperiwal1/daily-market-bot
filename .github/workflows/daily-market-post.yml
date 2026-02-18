@@ -1,14 +1,13 @@
 # .github/workflows/daily-market-post.yml
 #
 # Unified: Google Sheet market data + Finviz heatmap → single Slack post
-# Runs Mon–Fri at 4:15 PM ET (DST-aware), skips NYSE holidays + duplicates.
+# Runs Mon–Fri at ~4:15 PM ET, skips NYSE holidays + duplicates.
 
 name: Daily Market Summary + Heatmap
 
 on:
   schedule:
-    - cron: "15 20 * * 1-5"   # 4:15 PM EDT (summer)
-    - cron: "15 21 * * 1-5"   # 4:15 PM EST (winter)
+    - cron: "15 21 * * 1-5"   # ~4:15 PM EST / ~5:15 PM EDT — gate handles DST
   workflow_dispatch:           # manual trigger
 
 permissions:
@@ -26,59 +25,39 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       market_text: ${{ steps.run_bot.outputs.market_text }}
-      skipped: ${{ steps.gate.outputs.skipped }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Log current time
+      - name: Log current time (UTC & New York)
         run: |
-          echo "UTC:      $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
-          echo "New York: $(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "UTC now:      $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "New York now: $(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S %Z')"
 
-      # ── DST gate: only run the correct cron for the current timezone ──
-      # Manual triggers (workflow_dispatch) bypass all time checks
-      - name: DST + time window gate
-        id: gate
+      # ── Time gate (skipped for manual triggers) ──
+      - name: Proceed only if Mon-Fri and 16:00-16:30 in New York
+        if: github.event_name != 'workflow_dispatch'
         run: |
-          # Skip time checks entirely for manual triggers
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual trigger — bypassing time gate."
-            echo "skipped=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          NY_DOW=$(TZ="America/New_York" date +'%u')
+          NY_DOW=$(TZ="America/New_York" date +'%u')   # 1=Mon..5=Fri
           NY_HOUR=$(TZ="America/New_York" date +'%H')
           NY_MIN=$(TZ="America/New_York" date +'%M')
-          echo "NY: DOW=${NY_DOW} ${NY_HOUR}:${NY_MIN}"
-
-          # Skip weekends
+          echo "NY time detected: DOW=${NY_DOW} ${NY_HOUR}:${NY_MIN}"
           if [ "$NY_DOW" -lt 1 ] || [ "$NY_DOW" -gt 5 ]; then
             echo "Weekend — skipping."
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          # Must be within 15:45–16:45 ET window (GitHub cron can drift significantly)
-          TOTAL_MIN=$((NY_HOUR * 60 + NY_MIN))
-          if [ "$TOTAL_MIN" -lt 945 ] || [ "$TOTAL_MIN" -gt 1005 ]; then
-            echo "Outside 15:45–16:45 ET — wrong DST cron, skipping."
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          if [ "$NY_HOUR" != "16" ] || [ "$NY_MIN" -gt 30 ]; then
+            echo "Outside 16:00-16:30 ET window — skipping."
             exit 0
           fi
-
-          echo "Within window — continuing."
-          echo "skipped=false" >> "$GITHUB_OUTPUT"
+          echo "Within time window; continuing."
 
       # ── NYSE holiday check ──
-      - name: Set NY date
-        if: steps.gate.outputs.skipped != 'true'
+      - name: Set New York date env
         run: echo "DATE_NY=$(TZ='America/New_York' date +%Y-%m-%d)" >> $GITHUB_ENV
 
-      - name: Skip if NYSE holiday
-        if: steps.gate.outputs.skipped != 'true'
+      - name: Skip if NYSE holiday (US market closed)
         run: |
           python3 - <<'PY'
           import os
@@ -91,7 +70,10 @@ jobs:
               return d + timedelta(days=7*(n-1))
 
           def last_weekday(year, month, weekday):
-              d = date(year, month+1, 1) - timedelta(days=1) if month < 12 else date(year, 12, 31)
+              if month < 12:
+                  d = date(year, month+1, 1) - timedelta(days=1)
+              else:
+                  d = date(year, 12, 31)
               while d.weekday() != weekday:
                   d -= timedelta(days=1)
               return d
@@ -118,60 +100,54 @@ jobs:
           }
           today = date.fromisoformat(os.environ["DATE_NY"])
           if today in hol:
-              print(f"{today} is NYSE holiday — skipping."); raise SystemExit(0)
+              print(f"{today} is an NYSE holiday — skipping.")
+              raise SystemExit(0)
           print(f"{today} — not a holiday.")
           PY
 
       # ── Duplicate guard ──
       - name: Restore posted cache
-        if: steps.gate.outputs.skipped != 'true'
         id: posted_cache
         uses: actions/cache/restore@v4
         with:
           path: .post-cache-market
           key: market-posted-${{ env.DATE_NY }}
 
-      - name: Skip if already posted
-        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit == 'true'
+      - name: Skip if already posted today
+        if: steps.posted_cache.outputs.cache-hit == 'true'
         run: |
-          echo "Already posted for ${DATE_NY}."
-          echo "skipped=true" >> "$GITHUB_OUTPUT"
+          echo "Already posted for ${DATE_NY}. Skipping."
+          exit 0
 
       # ── Python setup + run ──
       - name: Set up Python
-        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
         run: |
+          python -m pip install --upgrade pip
           pip install requests playwright
           playwright install --with-deps chromium
 
       - name: Run daily market bot
         id: run_bot
-        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
         run: python daily_market_post.py
 
-      # ── Artifacts + cache ──
       # ── Preserve previous heatmaps so old Slack links don't break ──
-      - name: Download previous Pages artifact (if any)
-        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
+      - name: Restore previous heatmaps from GitHub Pages
         continue-on-error: true
         run: |
           OWNER="${GITHUB_REPOSITORY%%/*}"
           REPO="${GITHUB_REPOSITORY##*/}"
           BASE="https://${OWNER}.github.io/${REPO}"
 
-          # Fetch the index of existing heatmaps from the last 90 days
           echo "Restoring previous heatmaps from GitHub Pages..."
-          for i in $(seq 0 90); do
+          for i in $(seq 1 90); do
             DATE=$(date -u -d "$i days ago" +%Y-%m-%d 2>/dev/null || date -u -v-${i}d +%Y-%m-%d 2>/dev/null)
             FILE="sp500_heatmap_${DATE}.png"
             URL="${BASE}/${FILE}"
-            # Only download if we don't already have it locally
             if [ ! -f "site/${FILE}" ]; then
               HTTP_CODE=$(curl -s -o "site/${FILE}" -w "%{http_code}" "$URL")
               if [ "$HTTP_CODE" != "200" ]; then
@@ -181,21 +157,20 @@ jobs:
               fi
             fi
           done
-          echo "Done restoring previous heatmaps."
+          echo "Done."
 
       - name: Upload Pages artifact
-        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./site
 
-      - name: Save posted cache
-        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
+      - name: Mark posted today
         run: |
           mkdir -p .post-cache-market
           echo "posted $(date -u)" > .post-cache-market/posted.txt
-      - uses: actions/cache/save@v4
-        if: steps.gate.outputs.skipped != 'true' && steps.posted_cache.outputs.cache-hit != 'true'
+
+      - name: Save posted cache
+        uses: actions/cache/save@v4
         with:
           path: .post-cache-market
           key: market-posted-${{ env.DATE_NY }}
@@ -203,7 +178,6 @@ jobs:
   # ────────────────────────────────────────────────────────────────────
   deploy:
     needs: build
-    if: needs.build.outputs.skipped != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to GitHub Pages
@@ -212,7 +186,6 @@ jobs:
   # ────────────────────────────────────────────────────────────────────
   notify-slack:
     needs: [build, deploy]
-    if: needs.build.outputs.skipped != 'true'
     runs-on: ubuntu-latest
     env:
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
@@ -240,8 +213,6 @@ jobs:
         run: |
           HEAT_URL="${BASE_URL}/sp500_heatmap_${DATE_NY}.png"
 
-          # Build JSON payload — text summary + heatmap image
-          # Using jq for safe JSON escaping
           jq -n \
             --arg text "$MARKET_TEXT" \
             --arg img "$HEAT_URL" \

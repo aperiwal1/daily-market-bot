@@ -7,7 +7,7 @@ name: Daily Market Summary + Heatmap
 
 on:
   schedule:
-    - cron: "15 21 * * 1-5"   # ~4:15 PM EST / ~5:15 PM EDT — gate handles DST
+    - cron: "15 20 * * 1-5"   # ~4:15 PM EST / ~5:15 PM EDT — gate handles DST
   workflow_dispatch:           # manual trigger
 
 permissions:

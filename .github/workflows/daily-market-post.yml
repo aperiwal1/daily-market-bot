@@ -50,6 +50,7 @@ jobs:
       proceed: ${{ steps.decide.outputs.proceed }}
       date_ny: ${{ steps.gate.outputs.date_ny }}
       market_text: ${{ steps.run_bot.outputs.market_text }}
+      heatmap_sha: ${{ steps.heatmap_hash.outputs.sha }}
 
     steps:
       - name: Log trigger and current time (UTC & New York)
@@ -182,6 +183,16 @@ jobs:
         if: steps.decide.outputs.proceed == 'true'
         run: python daily_market_post.py
 
+      # Fingerprint of this run's image, so the Slack job can confirm Pages
+      # is serving the NEW image (not an earlier one at the same URL)
+      - name: Fingerprint heatmap image
+        id: heatmap_hash
+        if: steps.decide.outputs.proceed == 'true'
+        run: |
+          SHA=$(sha256sum "site/sp500_heatmap_${{ steps.gate.outputs.date_ny }}.png" | cut -c1-64)
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Heatmap sha256: ${SHA}"
+
       # ── Preserve previous heatmaps so old Slack links don't break ──
       - name: Restore previous heatmaps from GitHub Pages
         if: steps.decide.outputs.proceed == 'true'
@@ -230,6 +241,7 @@ jobs:
     env:
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
       DATE_NY: ${{ needs.build.outputs.date_ny }}
+      HEATMAP_SHA: ${{ needs.build.outputs.heatmap_sha }}
     steps:
       - name: Build URLs
         run: |
@@ -237,21 +249,31 @@ jobs:
           REPO="${GITHUB_REPOSITORY##*/}"
           echo "BASE_URL=https://${OWNER}.github.io/${REPO}" >> $GITHUB_ENV
 
-      - name: Wait for image on Pages (max ~2.5 min)
+      # Wait until Pages serves THIS run's image (matching fingerprint). An
+      # earlier image at the same URL returns 200 too, so status alone isn't enough.
+      - name: Wait for this run's image on Pages (max ~5 min)
         run: |
           URL="${BASE_URL}/sp500_heatmap_${DATE_NY}.png"
-          echo "Waiting for $URL"
-          for i in {1..30}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
-            [ "$code" = "200" ] && echo "OK" && break
+          echo "Waiting for $URL with sha256 ${HEATMAP_SHA}"
+          for i in {1..60}; do
+            curl -s -o heatmap_check.png "${URL}?check=${i}-$(date +%s)" || true
+            GOT=$(sha256sum heatmap_check.png 2>/dev/null | cut -c1-64)
+            if [ "$GOT" = "$HEATMAP_SHA" ]; then
+              echo "OK — new image is live on Pages"
+              exit 0
+            fi
             sleep 5
           done
+          echo "::error::New heatmap never appeared on Pages — not posting"
+          exit 1
 
       - name: Post combined message to Slack
         env:
           MARKET_TEXT: ${{ needs.build.outputs.market_text }}
         run: |
-          HEAT_URL="${BASE_URL}/sp500_heatmap_${DATE_NY}.png"
+          # ?v= makes the link unique per image, so Slack never reuses a
+          # cached copy of an earlier image posted at the same URL
+          HEAT_URL="${BASE_URL}/sp500_heatmap_${DATE_NY}.png?v=${HEATMAP_SHA:0:12}"
 
           jq -n \
             --arg text "$MARKET_TEXT" \

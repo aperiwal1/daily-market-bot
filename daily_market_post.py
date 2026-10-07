@@ -2,12 +2,14 @@
 Daily Market Summary + S&P 500 Heatmap
 ---------------------------------------
 1. Reads market data from Google Sheet (Score!A2:I2)
-2. Screenshots S&P 500 heatmap from TradingView (embedded stock-heatmap widget)
+2. Screenshots S&P 500 heatmap from TradingView (full heatmap page), after
+   verifying the data it draws is live (not stale/end-of-day)
 3. Outputs: heatmap image in ./site/ + market text to GITHUB_OUTPUT
 """
 
-import asyncio, os, shutil
+import asyncio, json, os, shutil
 from datetime import datetime
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright
 
@@ -27,46 +29,33 @@ REAL_UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# TradingView heatmap widget size. Must be fixed pixels — "100%" collapses
-# the treemap to ~150px tall.
-HEATMAP_WIDTH = 1600
-HEATMAP_HEIGHT = 1000
+# Full TradingView heatmap page. (The embeddable widget is NOT used: it is
+# served "end of day" data that is often a day or more stale.)
+HEATMAP_THEME = "light"   # "light" or "dark"
+HEATMAP_CONFIG = {
+    "dataSource": "SPX500",
+    "blockColor": "change",
+    "blockSize": "market_cap_basic",
+    "grouping": "sector",
+}
+HEATMAP_URL = "https://www.tradingview.com/heatmap/stock/#" + quote(
+    json.dumps(HEATMAP_CONFIG, separators=(",", ":"))
+)
+VIEWPORT = {"width": 1600, "height": 1200}
+LEGEND_HEIGHT = 45  # color legend drawn just below the treemap canvas
+
+# Accuracy checks — the heatmap is only posted if all pass
+MIN_STOCKS = 490            # S&P 500 has ~503 constituents
+MIN_LIVE_SHARE = 0.95       # share of stocks that must be live, not "endofday"
+SPOT_CHECK_COUNT = 10       # largest stocks re-fetched independently...
+SPOT_CHECK_MIN_MATCH = 8    # ...and at least this many must agree
+SPOT_CHECK_TOLERANCE = 0.25 # percentage points
+LOAD_ATTEMPTS = 3
 
 # Optional: set PLAYWRIGHT_CHANNEL=chrome to use the system Chrome instead of
 # Playwright's bundled Chromium (e.g. local runs where Chromium can't be
 # downloaded). Leave unset in CI.
 BROWSER_CHANNEL = os.environ.get("PLAYWRIGHT_CHANNEL") or None
-
-TV_WIDGET_HTML = f"""
-<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>html,body{{margin:0;background:#131722;}}</style></head>
-<body>
-<div class="tradingview-widget-container" style="width:{HEATMAP_WIDTH}px;height:{HEATMAP_HEIGHT}px;">
-  <div class="tradingview-widget-container__widget" style="width:100%;height:100%;"></div>
-  <script type="text/javascript"
-    src="https://s3.tradingview.com/external-embedding/embed-widget-stock-heatmap.js" async>
-  {{
-    "exchanges": [],
-    "dataSource": "SPX500",
-    "grouping": "sector",
-    "blockSize": "market_cap_basic",
-    "blockColor": "change",
-    "locale": "en",
-    "symbolUrl": "",
-    "colorTheme": "dark",
-    "hasTopBar": false,
-    "isDataSetEnabled": false,
-    "isZoomEnabled": false,
-    "hasSymbolTooltip": false,
-    "isMonoSize": false,
-    "width": {HEATMAP_WIDTH},
-    "height": {HEATMAP_HEIGHT}
-  }}
-  </script>
-</div>
-</body></html>
-"""
 
 DETAILS_URL = "https://docs.google.com/spreadsheets/d/14yA2ZECdrf4z5qfmFC7_ctOjBZSUZbsqVtQw2pdpN0Y/edit?usp=sharing"
 
@@ -135,19 +124,62 @@ def format_slack_message(d):
 
 
 # ── 2. Heatmap Screenshot ──────────────────────────────────────────────
-async def load_widget_with_retries(page, attempts=3):
-    """Load the TradingView widget page and wait for its iframe to appear."""
-    for i in range(1, attempts + 1):
-        try:
-            print(f"[Heatmap] widget load attempt {i}/{attempts}")
-            await page.set_content(TV_WIDGET_HTML, wait_until="networkidle", timeout=90_000)
-            await page.wait_for_selector(".tradingview-widget-container iframe", timeout=60_000)
+# Bounding box of the treemap canvas, or null until it has rendered
+CANVAS_JS = """() => {
+    const r = [...document.querySelectorAll('.js-market-heatmap canvas')]
+        .map(e => e.getBoundingClientRect())
+        .find(r => r.width > 600 && r.height > 400);
+    return r ? {x: r.x, y: r.y, width: r.width, height: r.height} : null;
+}"""
+
+# Independent fetch of the % change for a list of tickers (runs in the page)
+SPOT_CHECK_JS = """async (tickers) => {
+    const r = await fetch("https://scanner.tradingview.com/america/scan", {
+        method: "POST",
+        headers: {"Content-Type": "text/plain;charset=UTF-8"},
+        body: JSON.stringify({symbols: {tickers: tickers}, columns: ["change"]}),
+    });
+    return await r.json();
+}"""
+
+
+async def wait_for_heatmap_data(scan, timeout=30):
+    for _ in range(timeout * 2):
+        if "rows" in scan:
             return True
-        except Exception as e:
-            if i == attempts:
-                print(f"[Heatmap][ERR] widget load failed: {e}")
-            await asyncio.sleep(2 + i)
+        await asyncio.sleep(0.5)
     return False
+
+
+def check_freshness(rows, cols):
+    """Enough stocks, and nearly all live rather than stale end-of-day data."""
+    if len(rows) < MIN_STOCKS:
+        return False, f"only {len(rows)} stocks in heatmap data (need {MIN_STOCKS})"
+    ui = cols.index("update_mode")
+    live = sum(1 for r in rows if r["d"][ui] != "endofday")
+    share = live / len(rows)
+    msg = f"{len(rows)} stocks, {share:.0%} live"
+    if share < MIN_LIVE_SHARE:
+        return False, msg + f" (need {MIN_LIVE_SHARE:.0%}) — data is stale"
+    return True, msg
+
+
+async def spot_check(page, rows, cols):
+    """Re-fetch the largest stocks independently and compare % change."""
+    ci, mi, ni = cols.index("change"), cols.index("market_cap_basic"), cols.index("name")
+    top = sorted(rows, key=lambda r: -(r["d"][mi] or 0))[:SPOT_CHECK_COUNT]
+    fresh = await page.evaluate(SPOT_CHECK_JS, [r["s"] for r in top])
+    fresh_change = {r["s"]: r["d"][0] for r in fresh.get("data", [])}
+
+    matched, details = 0, []
+    for r in top:
+        shown, now = r["d"][ci], fresh_change.get(r["s"])
+        ok = shown is not None and now is not None and abs(shown - now) <= SPOT_CHECK_TOLERANCE
+        matched += ok
+        details.append(f"{r['d'][ni]} {shown:+.2f}/{now:+.2f}" if shown is not None and now is not None
+                       else f"{r['d'][ni]} n/a")
+    msg = f"spot check {matched}/{len(top)} match (shown/fresh): " + ", ".join(details)
+    return matched >= SPOT_CHECK_MIN_MATCH, msg
 
 
 async def capture_heatmap():
@@ -162,11 +194,15 @@ async def capture_heatmap():
             ],
         )
         context = await browser.new_context(
-            viewport={"width": HEATMAP_WIDTH, "height": HEATMAP_HEIGHT + 200},
+            viewport=VIEWPORT,
             user_agent=REAL_UA,
             java_script_enabled=True,
             accept_downloads=False,
         )
+        await context.add_cookies([{
+            "name": "theme", "value": HEATMAP_THEME,
+            "domain": ".tradingview.com", "path": "/",
+        }])
         page = await context.new_page()
 
         await page.add_init_script("""
@@ -176,26 +212,69 @@ async def capture_heatmap():
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
         """)
 
-        ok = await load_widget_with_retries(page, attempts=3)
-        if not ok:
+        # Capture the exact data the heatmap draws
+        scan = {}
+
+        async def on_response(resp):
+            if ("scanner.tradingview.com" in resp.url and "heatmap" in resp.url
+                    and resp.request.method == "POST"):
+                try:
+                    scan["cols"] = json.loads(resp.request.post_data)["columns"]
+                    scan["rows"] = (await resp.json())["data"]
+                except Exception as e:
+                    print(f"[Heatmap][WARN] could not read heatmap data: {e}")
+
+        page.on("response", on_response)
+
+        clip = None
+        for attempt in range(1, LOAD_ATTEMPTS + 1):
+            scan.clear()
+            print(f"[Heatmap] load attempt {attempt}/{LOAD_ATTEMPTS}")
+            try:
+                await page.goto(HEATMAP_URL, wait_until="domcontentloaded", timeout=90_000)
+                await page.wait_for_function(CANVAS_JS, timeout=60_000)
+                if not await wait_for_heatmap_data(scan):
+                    raise RuntimeError("heatmap data never arrived")
+
+                # Dismiss cookie / sign-in popups (best effort)
+                for sel in [
+                    'button:has-text("Accept all")',
+                    'button:has-text("Accept")',
+                    'button:has-text("Got it")',
+                    '[aria-label="Close"]',
+                ]:
+                    try:
+                        await page.locator(sel).first.click(timeout=1000)
+                        await asyncio.sleep(0.4)
+                    except:
+                        pass
+
+                # Let logos and labels finish drawing
+                await asyncio.sleep(10)
+
+                ok, msg = check_freshness(scan["rows"], scan["cols"])
+                print(f"[Heatmap] freshness: {msg}")
+                if ok:
+                    ok, msg = await spot_check(page, scan["rows"], scan["cols"])
+                    print(f"[Heatmap] {msg}")
+                if ok:
+                    canvas = await page.evaluate(CANVAS_JS)
+                    clip = {
+                        "x": 0,
+                        "y": canvas["y"],
+                        "width": VIEWPORT["width"],
+                        "height": min(canvas["height"] + LEGEND_HEIGHT, VIEWPORT["height"] - canvas["y"]),
+                    }
+                    break
+            except Exception as e:
+                print(f"[Heatmap][WARN] attempt {attempt} failed: {e}")
+            await asyncio.sleep(5)
+
+        if clip is None:
             await browser.close()
-            raise RuntimeError("TradingView heatmap widget failed to load")
+            raise RuntimeError("Heatmap data failed accuracy checks — not posting")
 
-        # Let the treemap finish rendering inside the iframe
-        print("[Heatmap] Waiting for treemap to render...")
-        await asyncio.sleep(10)
-
-        # Screenshot the widget container, fallback to full page
-        saved = False
-        try:
-            el = await page.query_selector(".tradingview-widget-container")
-            if el:
-                await el.screenshot(path=HEATMAP_PATH)
-                saved = True
-        except Exception as e:
-            print(f"[Heatmap][WARN] element screenshot failed: {e}")
-        if not saved:
-            await page.screenshot(path=HEATMAP_PATH, full_page=True)
+        await page.screenshot(path=HEATMAP_PATH, clip=clip)
 
         # Keep a "latest" copy
         try:

@@ -1,67 +1,71 @@
 # .github/workflows/daily-market-post.yml
 #
-# Unified: Google Sheet market data + Finviz heatmap → single Slack post
-# Runs Mon–Fri at ~4:15 PM ET, skips NYSE holidays + duplicates.
+# Unified: Google Sheet market data + TradingView heatmap → single Slack post
+#
+# Triggers:
+#   - workflow_dispatch (PRIMARY): fired on time at 4:15 PM ET by an external
+#     scheduler (cron-job.org → GitHub API), or manually from the Actions tab.
+#     Tick "force" on a manual run to bypass all gates (testing / re-post).
+#   - schedule (BACKUP ONLY): GitHub cron is best-effort and can run hours
+#     late or be dropped. Two entries so one lands at 4:15 PM ET in both
+#     EDT and EST; the gates below skip the extra one.
+#
+# Gates (unless forced): Mon–Fri, not an NYSE holiday, inside the ET post
+# window, and not already posted today. A gate that fails skips every
+# remaining step — nothing is built, deployed, or posted.
 
 name: Daily Market Summary + Heatmap
 
 on:
   schedule:
-    - cron: "15 20 * * 1-5"   # ~4:15 PM EST / ~5:15 PM EDT — gate handles DST
-  workflow_dispatch:           # manual trigger
+    - cron: "15 20 * * 1-5"   # 4:15 PM EDT (Mar–Nov) | 3:15 PM EST → skipped by window
+    - cron: "15 21 * * 1-5"   # 4:15 PM EST (Nov–Mar) | 5:15 PM EDT → skipped if already posted
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Bypass all gates (weekend / holiday / time window / already posted)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   pages: write
   id-token: write
 
+# Queue instead of cancel: a backup run that starts while the on-time run is
+# still going waits for it to finish, then skips via the "already posted" gate.
 concurrency:
-  group: daily-market-${{ github.ref }}
-  cancel-in-progress: true
+  group: daily-market-post
+  cancel-in-progress: false
+
+env:
+  POST_WINDOW_START: "16:00"   # ET — earliest post (after the close)
+  POST_WINDOW_END: "21:00"     # ET — latest post if the on-time trigger failed and only a late backup run arrives
 
 jobs:
   # ────────────────────────────────────────────────────────────────────
   build:
     runs-on: ubuntu-latest
     outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+      date_ny: ${{ steps.gate.outputs.date_ny }}
       market_text: ${{ steps.run_bot.outputs.market_text }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Log current time (UTC & New York)
+      - name: Log trigger and current time (UTC & New York)
         run: |
+          echo "Trigger:      ${{ github.event_name }}"
           echo "UTC now:      $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
           echo "New York now: $(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S %Z')"
 
-      # ── Time gate (skipped for manual triggers) ──
-      - name: Proceed only if Mon-Fri and 16:00-16:30 in New York
-        if: github.event_name != 'workflow_dispatch'
-        run: |
-          NY_DOW=$(TZ="America/New_York" date +'%u')   # 1=Mon..5=Fri
-          NY_HOUR=$(TZ="America/New_York" date +'%H')
-          NY_MIN=$(TZ="America/New_York" date +'%M')
-          echo "NY time detected: DOW=${NY_DOW} ${NY_HOUR}:${NY_MIN}"
-          if [ "$NY_DOW" -lt 1 ] || [ "$NY_DOW" -gt 5 ]; then
-            echo "Weekend — skipping."
-            exit 0
-          fi
-          if [ "$NY_HOUR" != "16" ] || [ "$NY_MIN" -gt 30 ]; then
-            echo "Outside 16:00-16:30 ET window — skipping."
-            exit 0
-          fi
-          echo "Within time window; continuing."
-
-      # ── NYSE holiday check ──
-      - name: Set New York date env
-        run: echo "DATE_NY=$(TZ='America/New_York' date +%Y-%m-%d)" >> $GITHUB_ENV
-
-      - name: Skip if NYSE holiday (US market closed)
+      # ── Gate: weekday + NYSE holiday + post window ──
+      - name: Check weekday, NYSE holiday, and post window
+        id: gate
         run: |
           python3 - <<'PY'
           import os
-          from datetime import date, timedelta
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
 
           def nth_weekday(year, month, weekday, n):
               d = date(year, month, 1)
@@ -91,41 +95,83 @@ jobs:
               if dt.weekday() == 6: return dt + timedelta(days=1)
               return dt
 
-          y = int(os.environ["DATE_NY"][:4])
+          def to_minutes(hhmm):
+              h, m = hhmm.split(":")
+              return int(h) * 60 + int(m)
+
+          now = datetime.now(ZoneInfo("America/New_York"))
+          today = now.date()
+          y = today.year
           hol = {
               observed(date(y,1,1)), nth_weekday(y,1,0,3), nth_weekday(y,2,0,3),
               easter_date(y) - timedelta(days=2), last_weekday(y,5,0),
               observed(date(y,6,19)), observed(date(y,7,4)), nth_weekday(y,9,0,1),
               nth_weekday(y,11,3,4), observed(date(y,12,25)),
           }
-          today = date.fromisoformat(os.environ["DATE_NY"])
-          if today in hol:
-              print(f"{today} is an NYSE holiday — skipping.")
-              raise SystemExit(0)
-          print(f"{today} — not a holiday.")
+
+          start = os.environ["POST_WINDOW_START"]
+          end = os.environ["POST_WINDOW_END"]
+          now_min = now.hour * 60 + now.minute
+
+          if today.weekday() >= 5:
+              is_open, reason = False, "Weekend"
+          elif today in hol:
+              is_open, reason = False, "NYSE holiday"
+          elif not (to_minutes(start) <= now_min <= to_minutes(end)):
+              is_open, reason = False, f"Outside {start}-{end} ET post window"
+          else:
+              is_open, reason = True, "Weekday, not a holiday, inside post window"
+
+          print(f"NY time {now:%Y-%m-%d %H:%M %Z}: {reason}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"open={'true' if is_open else 'false'}\n")
+              f.write(f"date_ny={today.isoformat()}\n")
           PY
 
-      # ── Duplicate guard ──
-      - name: Restore posted cache
+      # ── Gate: already posted today ──
+      - name: Check if already posted today
         id: posted_cache
+        if: steps.gate.outputs.open == 'true'
         uses: actions/cache/restore@v4
         with:
           path: .post-cache-market
-          key: market-posted-${{ env.DATE_NY }}
+          key: market-posted-${{ steps.gate.outputs.date_ny }}
+          lookup-only: true
 
-      - name: Skip if already posted today
-        if: steps.posted_cache.outputs.cache-hit == 'true'
+      - name: Decide whether to post
+        id: decide
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+          GATE_OPEN: ${{ steps.gate.outputs.open }}
+          ALREADY_POSTED: ${{ steps.posted_cache.outputs.cache-hit }}
         run: |
-          echo "Already posted for ${DATE_NY}. Skipping."
-          exit 0
+          if [ "$FORCE" = "true" ]; then
+            echo "Forced manual run — bypassing all gates."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$GATE_OPEN" != "true" ]; then
+            echo "Gate closed — skipping (see previous step for reason)."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          elif [ "$ALREADY_POSTED" = "true" ]; then
+            echo "Already posted for ${{ steps.gate.outputs.date_ny }} — skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "All gates passed — posting."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
 
-      # ── Python setup + run ──
+      # ── Everything below runs only if proceed == true ──
+      - name: Checkout repository
+        if: steps.decide.outputs.proceed == 'true'
+        uses: actions/checkout@v4
+
       - name: Set up Python
+        if: steps.decide.outputs.proceed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
+        if: steps.decide.outputs.proceed == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install requests playwright
@@ -133,10 +179,12 @@ jobs:
 
       - name: Run daily market bot
         id: run_bot
+        if: steps.decide.outputs.proceed == 'true'
         run: python daily_market_post.py
 
       # ── Preserve previous heatmaps so old Slack links don't break ──
       - name: Restore previous heatmaps from GitHub Pages
+        if: steps.decide.outputs.proceed == 'true'
         continue-on-error: true
         run: |
           OWNER="${GITHUB_REPOSITORY%%/*}"
@@ -160,24 +208,15 @@ jobs:
           echo "Done."
 
       - name: Upload Pages artifact
+        if: steps.decide.outputs.proceed == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./site
 
-      - name: Mark posted today
-        run: |
-          mkdir -p .post-cache-market
-          echo "posted $(date -u)" > .post-cache-market/posted.txt
-
-      - name: Save posted cache
-        uses: actions/cache/save@v4
-        with:
-          path: .post-cache-market
-          key: market-posted-${{ env.DATE_NY }}
-
   # ────────────────────────────────────────────────────────────────────
   deploy:
     needs: build
+    if: needs.build.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to GitHub Pages
@@ -186,16 +225,17 @@ jobs:
   # ────────────────────────────────────────────────────────────────────
   notify-slack:
     needs: [build, deploy]
+    if: needs.build.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     env:
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      DATE_NY: ${{ needs.build.outputs.date_ny }}
     steps:
       - name: Build URLs
         run: |
           OWNER="${GITHUB_REPOSITORY%%/*}"
           REPO="${GITHUB_REPOSITORY##*/}"
           echo "BASE_URL=https://${OWNER}.github.io/${REPO}" >> $GITHUB_ENV
-          echo "DATE_NY=$(TZ='America/New_York' date +%Y-%m-%d)" >> $GITHUB_ENV
 
       - name: Wait for image on Pages (max ~2.5 min)
         run: |
@@ -233,7 +273,22 @@ jobs:
           cat payload.json
           echo "----------------"
 
-          curl -sS --max-time 20 -X POST \
+          # --fail-with-body: a Slack error fails this step, so the run is NOT
+          # marked as posted and the backup run can retry.
+          curl -sS --fail-with-body --max-time 20 -X POST \
             -H 'Content-type: application/json' \
             --data @payload.json \
             "${SLACK_WEBHOOK}"
+
+      # ── Mark posted only after Slack succeeds ──
+      - name: Mark posted today
+        run: |
+          mkdir -p .post-cache-market
+          echo "posted $(date -u)" > .post-cache-market/posted.txt
+
+      - name: Save posted cache
+        continue-on-error: true   # key already exists on a forced re-post — harmless
+        uses: actions/cache/save@v4
+        with:
+          path: .post-cache-market
+          key: market-posted-${{ env.DATE_NY }}

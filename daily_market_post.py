@@ -2,7 +2,7 @@
 Daily Market Summary + S&P 500 Heatmap
 ---------------------------------------
 1. Reads market data from Google Sheet (Score!A2:I2)
-2. Screenshots S&P 500 heatmap from Finviz
+2. Screenshots S&P 500 heatmap from TradingView (embedded stock-heatmap widget)
 3. Outputs: heatmap image in ./site/ + market text to GITHUB_OUTPUT
 """
 
@@ -21,12 +21,52 @@ DATE_NY = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 HEATMAP_PATH = os.path.join(OUTPUT_DIR, f"sp500_heatmap_{DATE_NY}.png")
 HEATMAP_LATEST = os.path.join(OUTPUT_DIR, "sp500_heatmap_latest.png")
 
-FINVIZ_URL = "https://finviz.com/map.ashx"
 REAL_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+# TradingView heatmap widget size. Must be fixed pixels — "100%" collapses
+# the treemap to ~150px tall.
+HEATMAP_WIDTH = 1600
+HEATMAP_HEIGHT = 1000
+
+# Optional: set PLAYWRIGHT_CHANNEL=chrome to use the system Chrome instead of
+# Playwright's bundled Chromium (e.g. local runs where Chromium can't be
+# downloaded). Leave unset in CI.
+BROWSER_CHANNEL = os.environ.get("PLAYWRIGHT_CHANNEL") or None
+
+TV_WIDGET_HTML = f"""
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>html,body{{margin:0;background:#131722;}}</style></head>
+<body>
+<div class="tradingview-widget-container" style="width:{HEATMAP_WIDTH}px;height:{HEATMAP_HEIGHT}px;">
+  <div class="tradingview-widget-container__widget" style="width:100%;height:100%;"></div>
+  <script type="text/javascript"
+    src="https://s3.tradingview.com/external-embedding/embed-widget-stock-heatmap.js" async>
+  {{
+    "exchanges": [],
+    "dataSource": "SPX500",
+    "grouping": "sector",
+    "blockSize": "market_cap_basic",
+    "blockColor": "change",
+    "locale": "en",
+    "symbolUrl": "",
+    "colorTheme": "dark",
+    "hasTopBar": false,
+    "isDataSetEnabled": false,
+    "isZoomEnabled": false,
+    "hasSymbolTooltip": false,
+    "isMonoSize": false,
+    "width": {HEATMAP_WIDTH},
+    "height": {HEATMAP_HEIGHT}
+  }}
+  </script>
+</div>
+</body></html>
+"""
 
 DETAILS_URL = "https://docs.google.com/spreadsheets/d/14yA2ZECdrf4z5qfmFC7_ctOjBZSUZbsqVtQw2pdpN0Y/edit?usp=sharing"
 
@@ -95,16 +135,17 @@ def format_slack_message(d):
 
 
 # ── 2. Heatmap Screenshot ──────────────────────────────────────────────
-async def goto_with_retries(page, url, attempts=3):
+async def load_widget_with_retries(page, attempts=3):
+    """Load the TradingView widget page and wait for its iframe to appear."""
     for i in range(1, attempts + 1):
         try:
-            print(f"[Heatmap] goto attempt {i}/{attempts}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-            await page.wait_for_load_state("networkidle", timeout=60_000)
+            print(f"[Heatmap] widget load attempt {i}/{attempts}")
+            await page.set_content(TV_WIDGET_HTML, wait_until="networkidle", timeout=90_000)
+            await page.wait_for_selector(".tradingview-widget-container iframe", timeout=60_000)
             return True
         except Exception as e:
             if i == attempts:
-                print(f"[Heatmap][ERR] goto failed: {e}")
+                print(f"[Heatmap][ERR] widget load failed: {e}")
             await asyncio.sleep(2 + i)
     return False
 
@@ -113,6 +154,7 @@ async def capture_heatmap():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
+            channel=BROWSER_CHANNEL,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
@@ -120,7 +162,7 @@ async def capture_heatmap():
             ],
         )
         context = await browser.new_context(
-            viewport={"width": 1600, "height": 1200},
+            viewport={"width": HEATMAP_WIDTH, "height": HEATMAP_HEIGHT + 200},
             user_agent=REAL_UA,
             java_script_enabled=True,
             accept_downloads=False,
@@ -134,35 +176,24 @@ async def capture_heatmap():
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
         """)
 
-        ok = await goto_with_retries(page, FINVIZ_URL, attempts=3)
+        ok = await load_widget_with_retries(page, attempts=3)
         if not ok:
-            await page.goto(FINVIZ_URL, wait_until="load", timeout=120_000)
+            await browser.close()
+            raise RuntimeError("TradingView heatmap widget failed to load")
 
-        # Dismiss cookie banners (best effort)
-        for sel in [
-            'button:has-text("Accept")',
-            'button:has-text("I Accept")',
-            'button:has-text("Agree")',
-            '[aria-label*="accept"]',
-        ]:
-            try:
-                await page.locator(sel).first.click(timeout=1500)
-                await asyncio.sleep(0.4)
-                break
-            except:
-                pass
+        # Let the treemap finish rendering inside the iframe
+        print("[Heatmap] Waiting for treemap to render...")
+        await asyncio.sleep(10)
 
-        # Screenshot map element, fallback to full page
+        # Screenshot the widget container, fallback to full page
         saved = False
-        for sel in ["#map", 'div[id*="map"]', 'img[src*="map.ashx"]', "canvas"]:
-            try:
-                el = await page.query_selector(sel)
-                if el:
-                    await el.screenshot(path=HEATMAP_PATH)
-                    saved = True
-                    break
-            except:
-                pass
+        try:
+            el = await page.query_selector(".tradingview-widget-container")
+            if el:
+                await el.screenshot(path=HEATMAP_PATH)
+                saved = True
+        except Exception as e:
+            print(f"[Heatmap][WARN] element screenshot failed: {e}")
         if not saved:
             await page.screenshot(path=HEATMAP_PATH, full_page=True)
 

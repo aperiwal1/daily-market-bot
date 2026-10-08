@@ -51,6 +51,7 @@ jobs:
       date_ny: ${{ steps.gate.outputs.date_ny }}
       market_text: ${{ steps.run_bot.outputs.market_text }}
       heatmap_sha: ${{ steps.heatmap_hash.outputs.sha }}
+      heatmap_warning: ${{ steps.run_bot.outputs.heatmap_warning }}
 
     steps:
       - name: Log trigger and current time (UTC & New York)
@@ -242,6 +243,7 @@ jobs:
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
       DATE_NY: ${{ needs.build.outputs.date_ny }}
       HEATMAP_SHA: ${{ needs.build.outputs.heatmap_sha }}
+      HEATMAP_WARNING: ${{ needs.build.outputs.heatmap_warning }}
     steps:
       - name: Build URLs
         run: |
@@ -275,18 +277,22 @@ jobs:
           # cached copy of an earlier image posted at the same URL
           HEAT_URL="${BASE_URL}/sp500_heatmap_${DATE_NY}.png?v=${HEATMAP_SHA:0:12}"
 
+          # HEATMAP_WARNING is set when TradingView's data was incomplete:
+          # shown under the title with a yellow bar instead of green
           jq -n \
             --arg text "$MARKET_TEXT" \
             --arg img "$HEAT_URL" \
             --arg date "$DATE_NY" \
+            --arg warn "$HEATMAP_WARNING" \
             '{
               text: $text,
               attachments: [
                 {
                   fallback: ("S&P 500 Heatmap – " + $date),
                   title: ":world_map: S&P 500 Heatmap",
+                  text: (if $warn == "" then "" else (":warning: " + $warn) end),
                   image_url: $img,
-                  color: "#2eb886"
+                  color: (if $warn == "" then "#2eb886" else "#daa038" end)
                 }
               ]
             }' > payload.json

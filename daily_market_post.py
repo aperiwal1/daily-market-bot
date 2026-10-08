@@ -31,7 +31,7 @@ REAL_UA = (
 
 # Full TradingView heatmap page. (The embeddable widget is NOT used: it is
 # served "end of day" data that is often a day or more stale.)
-HEATMAP_THEME = "light"   # "light" or "dark"
+HEATMAP_THEME = "dark"   # "light" or "dark"
 HEATMAP_CONFIG = {
     "dataSource": "SPX500",
     "blockColor": "change",

@@ -44,13 +44,22 @@ HEATMAP_URL = "https://www.tradingview.com/heatmap/stock/#" + quote(
 VIEWPORT = {"width": 1600, "height": 1200}
 LEGEND_HEIGHT = 45  # color legend drawn just below the treemap canvas
 
-# Accuracy checks — the heatmap is only posted if all pass
-MIN_STOCKS = 490            # S&P 500 has ~503 constituents
+# Accuracy checks — stale data or a failed spot check blocks the post;
+# live-but-incomplete data is posted with a warning
+MIN_STOCKS = 490            # S&P 500 has ~503 constituents; fewer → post with a warning
+MIN_STOCKS_HARD = 250       # fewer than this → don't post (heatmap would be mostly empty)
 MIN_LIVE_SHARE = 0.95       # share of stocks that must be live, not "endofday"
 SPOT_CHECK_COUNT = 10       # largest stocks re-fetched independently...
 SPOT_CHECK_MIN_MATCH = 8    # ...and at least this many must agree
 SPOT_CHECK_TOLERANCE = 0.25 # percentage points
 LOAD_ATTEMPTS = 3
+
+# Largest S&P 500 names — only used to say which are missing when data is incomplete
+MAJOR_TICKERS = [
+    "NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "AVGO", "TSLA", "BRK.B", "LLY",
+    "JPM", "WMT", "V", "ORCL", "MA", "XOM", "UNH", "NFLX", "COST", "JNJ",
+    "HD", "PG", "ABBV", "BAC", "KO",
+]
 
 # Optional: set PLAYWRIGHT_CHANNEL=chrome to use the system Chrome instead of
 # Playwright's bundled Chromium (e.g. local runs where Chromium can't be
@@ -152,16 +161,33 @@ async def wait_for_heatmap_data(scan, timeout=30):
 
 
 def check_freshness(rows, cols):
-    """Enough stocks, and nearly all live rather than stale end-of-day data."""
-    if len(rows) < MIN_STOCKS:
-        return False, f"only {len(rows)} stocks in heatmap data (need {MIN_STOCKS})"
+    """Nearly all live rather than stale end-of-day data, and enough stocks.
+
+    Returns ("ok" | "incomplete" | "fail", message). "incomplete" means live
+    data but fewer stocks than the full index — posted with a warning.
+    """
+    if len(rows) < MIN_STOCKS_HARD:
+        return "fail", f"only {len(rows)} stocks in heatmap data (need {MIN_STOCKS_HARD} to post)"
     ui = cols.index("update_mode")
     live = sum(1 for r in rows if r["d"][ui] != "endofday")
     share = live / len(rows)
     msg = f"{len(rows)} stocks, {share:.0%} live"
     if share < MIN_LIVE_SHARE:
-        return False, msg + f" (need {MIN_LIVE_SHARE:.0%}) — data is stale"
-    return True, msg
+        return "fail", msg + f" (need {MIN_LIVE_SHARE:.0%}) — data is stale"
+    if len(rows) < MIN_STOCKS:
+        return "incomplete", msg + f" (expected {MIN_STOCKS}+) — data is incomplete"
+    return "ok", msg
+
+
+def incomplete_warning(rows, cols):
+    """Slack note for a heatmap built from incomplete data."""
+    ni = cols.index("name")
+    present = {r["d"][ni] for r in rows}
+    missing = [t for t in MAJOR_TICKERS if t not in present]
+    note = f"Heatmap incomplete — TradingView returned {len(rows)} of ~503 S&P 500 stocks."
+    if missing:
+        note += " Missing incl. " + ", ".join(missing) + "."
+    return note
 
 
 async def spot_check(page, rows, cols):
@@ -226,11 +252,16 @@ async def capture_heatmap():
 
         page.on("response", on_response)
 
-        clip = None
+        # warning: None = nothing saved yet, "" = complete heatmap saved,
+        # text = incomplete heatmap saved (most complete attempt so far)
+        warning, saved_rows = None, 0
         for attempt in range(1, LOAD_ATTEMPTS + 1):
             scan.clear()
             print(f"[Heatmap] load attempt {attempt}/{LOAD_ATTEMPTS}")
             try:
+                # Start from a blank page so every attempt is a real reload
+                # (re-opening the same URL only changes the #hash and loads nothing)
+                await page.goto("about:blank")
                 await page.goto(HEATMAP_URL, wait_until="domcontentloaded", timeout=90_000)
                 await page.wait_for_function(CANVAS_JS, timeout=60_000)
                 if not await wait_for_heatmap_data(scan):
@@ -252,12 +283,14 @@ async def capture_heatmap():
                 # Let logos and labels finish drawing
                 await asyncio.sleep(10)
 
-                ok, msg = check_freshness(scan["rows"], scan["cols"])
+                rows, cols = scan["rows"], scan["cols"]
+                status, msg = check_freshness(rows, cols)
                 print(f"[Heatmap] freshness: {msg}")
+                ok = status != "fail"
                 if ok:
-                    ok, msg = await spot_check(page, scan["rows"], scan["cols"])
+                    ok, msg = await spot_check(page, rows, cols)
                     print(f"[Heatmap] {msg}")
-                if ok:
+                if ok and (status == "ok" or len(rows) > saved_rows):
                     canvas = await page.evaluate(CANVAS_JS)
                     clip = {
                         "x": 0,
@@ -265,16 +298,22 @@ async def capture_heatmap():
                         "width": VIEWPORT["width"],
                         "height": min(canvas["height"] + LEGEND_HEIGHT, VIEWPORT["height"] - canvas["y"]),
                     }
+                    await page.screenshot(path=HEATMAP_PATH, clip=clip)
+                    saved_rows = len(rows)
+                    warning = "" if status == "ok" else incomplete_warning(rows, cols)
+                if ok and status == "ok":
                     break
+                if ok:
+                    print("[Heatmap][WARN] data incomplete — retrying for a full set")
             except Exception as e:
                 print(f"[Heatmap][WARN] attempt {attempt} failed: {e}")
             await asyncio.sleep(5)
 
-        if clip is None:
+        if warning is None:
             await browser.close()
             raise RuntimeError("Heatmap data failed accuracy checks — not posting")
-
-        await page.screenshot(path=HEATMAP_PATH, clip=clip)
+        if warning:
+            print(f"[Heatmap][WARN] posting with warning: {warning}")
 
         # Keep a "latest" copy
         try:
@@ -284,6 +323,7 @@ async def capture_heatmap():
 
         print(f"[Heatmap][OK] Saved: {HEATMAP_PATH}")
         await browser.close()
+        return warning
 
 
 # ── Main ────────────────────────────────────────────────────────────────
@@ -297,10 +337,10 @@ async def main():
     message_text = format_slack_message(sheet_data)
     print(f"\n[Sheet] Data:\n{message_text}\n")
 
-    # 2. Capture heatmap
-    await capture_heatmap()
+    # 2. Capture heatmap ("" if complete, else a warning to show in Slack)
+    heatmap_warning = await capture_heatmap()
 
-    # 3. Write message text to GITHUB_OUTPUT for the workflow
+    # 3. Write message text + heatmap warning to GITHUB_OUTPUT for the workflow
     gh_output = os.environ.get("GITHUB_OUTPUT")
     if gh_output:
         with open(gh_output, "a") as f:
@@ -308,6 +348,7 @@ async def main():
             f.write("market_text<<EOF\n")
             f.write(message_text + "\n")
             f.write("EOF\n")
+            f.write(f"heatmap_warning={heatmap_warning}\n")
         print("[Output] Written to GITHUB_OUTPUT")
     else:
         print("[Output] No GITHUB_OUTPUT (local run)")

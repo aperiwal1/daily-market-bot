@@ -45,8 +45,8 @@ VIEWPORT = {"width": 1600, "height": 1200}
 LEGEND_HEIGHT = 45  # color legend drawn just below the treemap canvas
 
 # Accuracy checks — stale data or a failed spot check blocks the post;
-# live-but-incomplete data is posted with a warning
-MIN_STOCKS = 490            # S&P 500 has ~503 constituents; fewer → post with a warning
+# live-but-incomplete data is still posted (noted in the Actions log)
+MIN_STOCKS = 490            # S&P 500 has ~503 constituents; fewer → retry, then post anyway
 MIN_STOCKS_HARD = 250       # fewer than this → don't post (heatmap would be mostly empty)
 MIN_LIVE_SHARE = 0.95       # share of stocks that must be live, not "endofday"
 SPOT_CHECK_COUNT = 10       # largest stocks re-fetched independently...
@@ -164,7 +164,7 @@ def check_freshness(rows, cols):
     """Nearly all live rather than stale end-of-day data, and enough stocks.
 
     Returns ("ok" | "incomplete" | "fail", message). "incomplete" means live
-    data but fewer stocks than the full index — posted with a warning.
+    data but fewer stocks than the full index — still posted.
     """
     if len(rows) < MIN_STOCKS_HARD:
         return "fail", f"only {len(rows)} stocks in heatmap data (need {MIN_STOCKS_HARD} to post)"
@@ -180,7 +180,7 @@ def check_freshness(rows, cols):
 
 
 def incomplete_warning(rows, cols):
-    """Slack note for a heatmap built from incomplete data."""
+    """Actions-log note for a heatmap built from incomplete data."""
     ni = cols.index("name")
     present = {r["d"][ni] for r in rows}
     missing = [t for t in MAJOR_TICKERS if t not in present]
@@ -313,7 +313,7 @@ async def capture_heatmap():
             await browser.close()
             raise RuntimeError("Heatmap data failed accuracy checks — not posting")
         if warning:
-            print(f"[Heatmap][WARN] posting with warning: {warning}")
+            print(f"[Heatmap][WARN] posting anyway: {warning}")
 
         # Keep a "latest" copy
         try:
@@ -337,10 +337,10 @@ async def main():
     message_text = format_slack_message(sheet_data)
     print(f"\n[Sheet] Data:\n{message_text}\n")
 
-    # 2. Capture heatmap ("" if complete, else a warning to show in Slack)
-    heatmap_warning = await capture_heatmap()
+    # 2. Capture heatmap (incomplete data is noted in the Actions log only)
+    await capture_heatmap()
 
-    # 3. Write message text + heatmap warning to GITHUB_OUTPUT for the workflow
+    # 3. Write message text to GITHUB_OUTPUT for the workflow
     gh_output = os.environ.get("GITHUB_OUTPUT")
     if gh_output:
         with open(gh_output, "a") as f:
@@ -348,7 +348,6 @@ async def main():
             f.write("market_text<<EOF\n")
             f.write(message_text + "\n")
             f.write("EOF\n")
-            f.write(f"heatmap_warning={heatmap_warning}\n")
         print("[Output] Written to GITHUB_OUTPUT")
     else:
         print("[Output] No GITHUB_OUTPUT (local run)")
